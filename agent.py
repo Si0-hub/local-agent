@@ -1,273 +1,159 @@
 import ollama
 import json
 import os
-import subprocess
-import glob
+import uuid
+import logging
+from datetime import datetime
+
+AGENT_HOME = os.path.join(os.path.expanduser("~"), ".agent")
+PROJECTS_DIR = os.path.join(AGENT_HOME, "projects")
+
+DEFAULT_SYSTEM_PROMPT = "你是一個本地 AI 助手，運行在使用者的電腦上。"
+
+logging.basicConfig(
+    filename="agent.log",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
 
 
-# ===== 工具定義 =====
-
-def read_file(path: str) -> str:
-    """讀取檔案內容"""
-    try:
-        path = os.path.abspath(path)
-        if not os.path.exists(path):
-            return f"錯誤：檔案不存在 → {path}"
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        if len(content) > 10000:
-            content = content[:10000] + "\n\n... (檔案過大，僅顯示前 10000 字元)"
-        return content
-    except Exception as e:
-        return f"讀取失敗：{e}"
+def path_to_dirname(path: str) -> str:
+    """將路徑轉成資料夾名稱（如 E:\\workspace\\agent → E--workspace-agent）"""
+    path = os.path.abspath(path)
+    # 移除尾部斜線，替換 : / \ 為 -
+    path = path.rstrip("/\\")
+    return path.replace(":", "").replace("\\", "-").replace("/", "-")
 
 
-def search_files(pattern: str, directory: str = ".") -> str:
-    """搜尋符合 pattern 的檔案（支援 glob 模式）"""
-    try:
-        directory = os.path.abspath(directory)
-        matches = glob.glob(os.path.join(directory, "**", pattern), recursive=True)
-        if not matches:
-            return f"沒有找到符合 '{pattern}' 的檔案"
-        result = f"找到 {len(matches)} 個檔案：\n"
-        for m in matches[:50]:
-            result += f"  {m}\n"
-        if len(matches) > 50:
-            result += f"  ... 還有 {len(matches) - 50} 個檔案"
-        return result
-    except Exception as e:
-        return f"搜尋失敗：{e}"
+def get_project_dir(project_path: str) -> str:
+    """取得專案在 ~/.agent/projects/ 下的資料夾路徑"""
+    dirname = path_to_dirname(project_path)
+    return os.path.join(PROJECTS_DIR, dirname)
 
 
-def search_content(keyword: str, directory: str = ".", file_ext: str = "*") -> str:
-    """在檔案中搜尋包含關鍵字的行"""
-    try:
-        directory = os.path.abspath(directory)
-        pattern = os.path.join(directory, "**", f"*.{file_ext}" if file_ext != "*" else "*")
-        files = glob.glob(pattern, recursive=True)
-        results = []
-        for filepath in files:
-            if os.path.isdir(filepath):
-                continue
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                    for i, line in enumerate(f, 1):
-                        if keyword.lower() in line.lower():
-                            results.append(f"{filepath}:{i}: {line.rstrip()}")
-                            if len(results) >= 30:
-                                break
-            except Exception:
-                continue
-            if len(results) >= 30:
-                break
-        if not results:
-            return f"沒有找到包含 '{keyword}' 的內容"
-        return f"找到 {len(results)} 筆結果：\n" + "\n".join(results)
-    except Exception as e:
-        return f"搜尋失敗：{e}"
-
-
-def list_directory(path: str = ".") -> str:
-    """列出目錄內容"""
-    try:
-        path = os.path.abspath(path)
-        if not os.path.isdir(path):
-            return f"錯誤：不是有效的目錄 → {path}"
-        entries = os.listdir(path)
-        result = f"目錄：{path}\n"
-        dirs = []
-        files = []
-        for e in sorted(entries):
-            full = os.path.join(path, e)
-            if os.path.isdir(full):
-                dirs.append(f"  📁 {e}/")
-            else:
-                size = os.path.getsize(full)
-                files.append(f"  📄 {e}  ({_format_size(size)})")
-        result += "\n".join(dirs + files)
-        return result
-    except Exception as e:
-        return f"列出目錄失敗：{e}"
-
-
-def run_command(command: str) -> str:
-    """執行系統指令"""
-    # 安全檢查：封鎖危險指令
-    dangerous = ["rm -rf /", "format c:", "del /f /s /q c:", "shutdown", "mkfs"]
-    for d in dangerous:
-        if d.lower() in command.lower():
-            return f"封鎖危險指令：{command}"
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=os.getcwd(),
-        )
-        output = ""
-        if result.stdout:
-            output += result.stdout
-        if result.stderr:
-            output += "\n[STDERR]\n" + result.stderr
-        if result.returncode != 0:
-            output += f"\n[返回碼: {result.returncode}]"
-        return output.strip() if output.strip() else "(指令執行完成，無輸出)"
-    except subprocess.TimeoutExpired:
-        return "錯誤：指令執行超時（30 秒）"
-    except Exception as e:
-        return f"執行失敗：{e}"
-
-
-def _format_size(size: int) -> str:
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TB"
-
-
-# ===== 工具清單（給模型看的） =====
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "讀取指定檔案的內容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "檔案路徑"}
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "搜尋符合 pattern 的檔案名稱（支援 glob 模式，例如 *.py）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "檔案名稱模式，如 *.py, *.txt"},
-                    "directory": {"type": "string", "description": "搜尋目錄，預設為目前目錄"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_content",
-            "description": "在檔案內容中搜尋包含關鍵字的行",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string", "description": "要搜尋的關鍵字"},
-                    "directory": {"type": "string", "description": "搜尋目錄，預設為目前目錄"},
-                    "file_ext": {"type": "string", "description": "限定副檔名，如 py、txt，預設為 *（全部）"},
-                },
-                "required": ["keyword"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "列出指定目錄中的檔案和資料夾",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "目錄路徑，預設為目前目錄"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "執行系統終端指令（如 git status, python script.py, dir 等）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要執行的指令"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-]
-
-# 工具名稱對應函式
-TOOL_FUNCTIONS = {
-    "read_file": read_file,
-    "search_files": search_files,
-    "search_content": search_content,
-    "list_directory": list_directory,
-    "run_command": run_command,
-}
-
-SYSTEM_PROMPT = """你是一個本地 AI 助手，運行在 Windows 系統上。你必須自己用工具完成任務，絕對不要叫使用者自己去做。
-"""
+def list_projects() -> list[dict]:
+    """列出所有已建立的專案"""
+    if not os.path.exists(PROJECTS_DIR):
+        return []
+    projects = []
+    for name in sorted(os.listdir(PROJECTS_DIR)):
+        project_dir = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(project_dir):
+            continue
+        # 讀取原始路徑
+        meta_path = os.path.join(project_dir, "project.json")
+        original_path = name  # fallback
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                original_path = json.load(f).get("path", name)
+        sessions = [f for f in os.listdir(project_dir) if f.endswith(".jsonl")]
+        projects.append({"name": name, "original_path": original_path, "path": project_dir, "sessions": len(sessions)})
+    return projects
 
 
 class Agent:
-    def __init__(self, model: str = "qwen3:4b"):
+    def __init__(self, model: str, project_path: str, session_id: str | None = None, project_dir: str | None = None):
         self.model = model
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.project_path = os.path.abspath(project_path)
+        # 若直接傳入 project_dir（已有專案），就不重新計算
+        self.project_dir = project_dir or get_project_dir(project_path)
+        self.session_id = session_id or uuid.uuid4().hex[:8]
+
+        # 建立專案資料夾並儲存原始路徑
+        os.makedirs(self.project_dir, exist_ok=True)
+        meta_path = os.path.join(self.project_dir, "project.json")
+        if not os.path.exists(meta_path):
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({"path": self.project_path}, f, ensure_ascii=False)
+
+        # 載入 system prompt
+        system_prompt = self._load_system_prompt()
+
+        # 載入對話歷史
+        self.messages = [{"role": "system", "content": system_prompt}]
+        self._load_history()
+
+    def _load_system_prompt(self) -> str:
+        """讀取 SYSTEM.md 作為 system prompt"""
+        system_md = os.path.join(self.project_dir, "SYSTEM.md")
+        if os.path.exists(system_md):
+            with open(system_md, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        # 不存在則建立預設
+        with open(system_md, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_SYSTEM_PROMPT)
+        return DEFAULT_SYSTEM_PROMPT
+
+    @property
+    def _session_path(self) -> str:
+        return os.path.join(self.project_dir, f"{self.session_id}.jsonl")
+
+    def _load_history(self):
+        """從 JSONL 載入對話歷史，只取最近 20 輪（40 條訊息）"""
+        path = self._session_path
+        if not os.path.exists(path):
+            return
+
+        entries = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("role") in ("user", "assistant"):
+                        entries.append(entry)
+                except json.JSONDecodeError:
+                    continue
+
+        # 只取最近 20 輪（40 條）
+        recent = entries[-40:]
+        for entry in recent:
+            self.messages.append({"role": entry["role"], "content": entry["content"]})
+
+    def _append_log(self, role: str, content: str):
+        """追加一行到 JSONL"""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "role": role,
+            "content": content,
+        }
+        with open(self._session_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def chat(self, user_input: str) -> str:
+        """送出訊息，取得回應"""
         self.messages.append({"role": "user", "content": user_input})
+        self._append_log("user", user_input)
 
-        # 呼叫模型
+        logging.info(">>> 送出給模型的 messages:\n%s", json.dumps(self.messages, ensure_ascii=False, indent=2))
+
         response = ollama.chat(
             model=self.model,
             messages=self.messages,
-            tools=TOOLS,
         )
 
-        msg = response["message"]
+        reply = response["message"]["content"]
+        logging.info("<<< 模型回應:\n%s", reply)
 
-        # 處理工具呼叫（可能多輪）
-        while msg.get("tool_calls"):
-            self.messages.append(msg)
+        self.messages.append({"role": "assistant", "content": reply})
+        self._append_log("assistant", reply)
+        return reply
 
-            for tool_call in msg["tool_calls"]:
-                func_name = tool_call["function"]["name"]
-                func_args = tool_call["function"]["arguments"]
-
-                print(f"  🔧 執行工具：{func_name}({func_args})")
-
-                if func_name in TOOL_FUNCTIONS:
-                    result = TOOL_FUNCTIONS[func_name](**func_args)
-                else:
-                    result = f"未知工具：{func_name}"
-
-                self.messages.append({
-                    "role": "tool",
-                    "content": result,
-                })
-
-            # 讓模型根據工具結果繼續回應
-            response = ollama.chat(
-                model=self.model,
-                messages=self.messages,
-                tools=TOOLS,
-            )
-            msg = response["message"]
-
-        # 最終回應
-        self.messages.append(msg)
-        return msg.get("content", "")
+    def list_sessions(self) -> list[dict]:
+        """列出當前專案的所有 session"""
+        sessions = []
+        for f in sorted(os.listdir(self.project_dir)):
+            if f.endswith(".jsonl"):
+                sid = f.replace(".jsonl", "")
+                filepath = os.path.join(self.project_dir, f)
+                mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                sessions.append({"id": sid, "modified": mtime.strftime("%Y-%m-%d %H:%M")})
+        return sessions
 
     def clear_history(self):
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        print("  對話記錄已清除。")
+        """清除記憶中的對話歷史（JSONL 保留）"""
+        system_prompt = self.messages[0]["content"]
+        self.messages = [{"role": "system", "content": system_prompt}]

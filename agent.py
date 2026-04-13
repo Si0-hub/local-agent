@@ -1,9 +1,10 @@
-import ollama
 import json
 import os
 import uuid
 import logging
 from datetime import datetime
+
+from providers import Message, ProviderRegistry
 
 AGENT_HOME = os.path.join(os.path.expanduser("~"), ".agent")
 PROJECTS_DIR = os.path.join(AGENT_HOME, "projects")
@@ -53,8 +54,9 @@ def list_projects() -> list[dict]:
 
 
 class Agent:
-    def __init__(self, model: str, project_path: str, session_id: str | None = None, project_dir: str | None = None):
-        self.model = model
+    def __init__(self, registry: ProviderRegistry, project_path: str, provider_name: str | None = None, session_id: str | None = None, project_dir: str | None = None):
+        self.registry = registry
+        self.provider = registry.get(provider_name)
         self.project_path = os.path.abspath(project_path)
         # 若直接傳入 project_dir（已有專案），就不重新計算
         self.project_dir = project_dir or get_project_dir(project_path)
@@ -71,7 +73,7 @@ class Agent:
         system_prompt = self._load_system_prompt()
 
         # 載入對話歷史
-        self.messages = [{"role": "system", "content": system_prompt}]
+        self.messages: list[Message] = [Message(role="system", content=system_prompt)]
         self._load_history()
 
     def _load_system_prompt(self) -> str:
@@ -111,7 +113,7 @@ class Agent:
         # 只取最近 20 輪（40 條）
         recent = entries[-40:]
         for entry in recent:
-            self.messages.append({"role": entry["role"], "content": entry["content"]})
+            self.messages.append(Message(role=entry["role"], content=entry["content"]))
 
     def _append_log(self, role: str, content: str):
         """追加一行到 JSONL"""
@@ -125,22 +127,19 @@ class Agent:
 
     def chat(self, user_input: str) -> str:
         """送出訊息，取得回應"""
-        self.messages.append({"role": "user", "content": user_input})
+        self.messages.append(Message(role="user", content=user_input))
         self._append_log("user", user_input)
 
-        logging.info(">>> 送出給模型的 messages:\n%s", json.dumps(self.messages, ensure_ascii=False, indent=2))
+        logging.info(">>> 送出給模型的 messages:\n%s",
+        json.dumps([m.to_dict() for m in self.messages], ensure_ascii=False, indent=2))
 
-        response = ollama.chat(
-            model=self.model,
-            messages=self.messages,
-        )
+        response = self.provider.chat(self.messages)
 
-        reply = response["message"]["content"]
-        logging.info("<<< 模型回應:\n%s", reply)
+        logging.info("<<< 模型回應:\n%s", response.content)
 
-        self.messages.append({"role": "assistant", "content": reply})
-        self._append_log("assistant", reply)
-        return reply
+        self.messages.append(Message(role="assistant", content=response.content))
+        self._append_log("assistant", response.content)
+        return response.content
 
     def list_sessions(self) -> list[dict]:
         """列出當前專案的所有 session"""
@@ -155,5 +154,5 @@ class Agent:
 
     def clear_history(self):
         """清除記憶中的對話歷史（JSONL 保留）"""
-        system_prompt = self.messages[0]["content"]
-        self.messages = [{"role": "system", "content": system_prompt}]
+        system_msg = self.messages[0]
+        self.messages = [system_msg]

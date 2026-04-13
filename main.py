@@ -2,9 +2,13 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from agent import Agent, list_projects
+from providers import LLM, ProviderRegistry
 
 console = Console()
-MODEL = "qwen3:4b"
+
+# 集中註冊所有 LLM
+registry = ProviderRegistry()
+registry.register("fast", LLM(model="ollama_chat/qwen3:4b"), default=True)
 
 
 def select_project() -> dict:
@@ -73,7 +77,7 @@ def select_session(project_dir: str) -> str | None:
 def main():
     console.print(Panel(
         "[bold green]本地 AI Agent[/bold green]\n"
-        f"模型：{MODEL}",
+        f"模型：{registry.get().model}",
         title="🤖 Agent",
     ))
 
@@ -86,7 +90,7 @@ def main():
     session_id = select_session(project_dir)
 
     # 建立 Agent
-    agent = Agent(model=MODEL, project_path=project_path, session_id=session_id, project_dir=project_dir)
+    agent = Agent(registry=registry, project_path=project_path, session_id=session_id, project_dir=project_dir)
 
     console.print(Panel(
         f"專案：{agent.project_path}\n"
@@ -120,7 +124,7 @@ def main():
             continue
 
         if user_input.lower() == "/new":
-            agent = Agent(model=MODEL, project_path=project_path, project_dir=agent.project_dir)
+            agent = Agent(registry=registry, project_path=project_path, project_dir=agent.project_dir)
             console.print(f"  ✅ 新 session：{agent.session_id}")
             continue
 
@@ -137,7 +141,7 @@ def main():
         if user_input.lower().startswith("/switch "):
             sid = user_input[8:].strip()
             if sid:
-                agent = Agent(model=MODEL, project_path=project_path, session_id=sid, project_dir=agent.project_dir)
+                agent = Agent(registry=registry, project_path=project_path, session_id=sid, project_dir=agent.project_dir)
                 console.print(f"  ✅ 已切換至 session：{agent.session_id}")
             continue
 

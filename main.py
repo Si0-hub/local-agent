@@ -3,12 +3,17 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from agent import Agent, list_projects
 from providers import LLM, ProviderRegistry
+from tools import ToolRegistry, read_file, list_directory, search_file
 
 console = Console()
 
 # 集中註冊所有 LLM
 registry = ProviderRegistry()
 registry.register("fast", LLM(model="ollama_chat/qwen3:4b"), default=True)
+
+# 集中註冊所有工具
+tools = ToolRegistry()
+tools.register(read_file, list_directory, search_file)
 
 
 def select_project() -> dict:
@@ -90,7 +95,7 @@ def main():
     session_id = select_session(project_dir)
 
     # 建立 Agent
-    agent = Agent(registry=registry, project_path=project_path, session_id=session_id, project_dir=project_dir)
+    agent = Agent(registry=registry, tools=tools, project_path=project_path, session_id=session_id, project_dir=project_dir)
 
     console.print(Panel(
         f"專案：{agent.project_path}\n"
@@ -124,7 +129,7 @@ def main():
             continue
 
         if user_input.lower() == "/new":
-            agent = Agent(registry=registry, project_path=project_path, project_dir=agent.project_dir)
+            agent = Agent(registry=registry, tools=tools, project_path=project_path, project_dir=agent.project_dir)
             console.print(f"  ✅ 新 session：{agent.session_id}")
             continue
 
@@ -141,14 +146,22 @@ def main():
         if user_input.lower().startswith("/switch "):
             sid = user_input[8:].strip()
             if sid:
-                agent = Agent(registry=registry, project_path=project_path, session_id=sid, project_dir=agent.project_dir)
+                agent = Agent(registry=registry, tools=tools, project_path=project_path, session_id=sid, project_dir=agent.project_dir)
                 console.print(f"  ✅ 已切換至 session：{agent.session_id}")
             continue
 
         try:
-            response = agent.chat(user_input)
             console.print()
+            with console.status("[cyan]思考中...[/cyan]", spinner="dots"):
+                response = agent.chat(user_input)
             console.print(Panel(Markdown(response), title="🤖 Agent", border_style="green"))
+
+            stats = agent.last_stats
+            console.print(
+                f"[dim]context: {stats.get('total_tokens', 0)} tokens  |  "
+                f"included: {stats.get('included', 0)}  |  "
+                f"dropped: {stats.get('dropped', 0)}[/dim]"
+            )
         except Exception as e:
             console.print(f"\n[red]錯誤：{e}[/red]")
 

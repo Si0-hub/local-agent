@@ -3,8 +3,11 @@ import os
 import uuid
 import logging
 from datetime import datetime
+from typing import Iterator
 
 from providers import Message, ProviderRegistry
+from context import ContextAssembler, Summarizer
+from tools import ToolRegistry
 
 AGENT_HOME = os.path.join(os.path.expanduser("~"), ".agent")
 PROJECTS_DIR = os.path.join(AGENT_HOME, "projects")
@@ -54,9 +57,18 @@ def list_projects() -> list[dict]:
 
 
 class Agent:
-    def __init__(self, registry: ProviderRegistry, project_path: str, provider_name: str | None = None, session_id: str | None = None, project_dir: str | None = None):
+    # 當記憶中訊息數超過此閾值時觸發摘要，壓縮最舊一半
+    SUMMARIZE_THRESHOLD = 30
+    # ReAct loop 最多迭代次數，避免無限循環
+    MAX_ITERATIONS = 10
+
+    def __init__(self, registry: ProviderRegistry, project_path: str, provider_name: str | None = None, session_id: str | None = None, project_dir: str | None = None, max_tokens: int = 8000, tools: ToolRegistry | None = None):
         self.registry = registry
         self.provider = registry.get(provider_name)
+        self.assembler = ContextAssembler(model=self.provider.model, max_tokens=max_tokens)
+        self.summarizer = Summarizer(llm=self.provider)
+        self.tools = tools or ToolRegistry()
+        self.last_stats: dict = {}
         self.project_path = os.path.abspath(project_path)
         # 若直接傳入 project_dir（已有專案），就不重新計算
         self.project_dir = project_dir or get_project_dir(project_path)
@@ -71,6 +83,9 @@ class Agent:
 
         # 載入 system prompt
         system_prompt = self._load_system_prompt()
+
+        # 載入長期記憶摘要
+        self.summary: str = self._load_summary()
 
         # 載入對話歷史
         self.messages: list[Message] = [Message(role="system", content=system_prompt)]
@@ -91,13 +106,26 @@ class Agent:
     def _session_path(self) -> str:
         return os.path.join(self.project_dir, f"{self.session_id}.jsonl")
 
+    @property
+    def _summary_path(self) -> str:
+        return os.path.join(self.project_dir, f"{self.session_id}.summary.md")
+
+    def _load_summary(self) -> str:
+        if os.path.exists(self._summary_path):
+            with open(self._summary_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        return ""
+
+    def _save_summary(self):
+        with open(self._summary_path, "w", encoding="utf-8") as f:
+            f.write(self.summary)
+
     def _load_history(self):
-        """從 JSONL 載入對話歷史，只取最近 20 輪（40 條訊息）"""
+        """從 JSONL 載入完整對話歷史，由 ContextAssembler 決定實際送進 LLM 的範圍"""
         path = self._session_path
         if not os.path.exists(path):
             return
 
-        entries = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -106,14 +134,9 @@ class Agent:
                 try:
                     entry = json.loads(line)
                     if entry.get("role") in ("user", "assistant"):
-                        entries.append(entry)
+                        self.messages.append(Message(role=entry["role"], content=entry["content"]))
                 except json.JSONDecodeError:
                     continue
-
-        # 只取最近 20 輪（40 條）
-        recent = entries[-40:]
-        for entry in recent:
-            self.messages.append(Message(role=entry["role"], content=entry["content"]))
 
     def _append_log(self, role: str, content: str):
         """追加一行到 JSONL"""
@@ -125,21 +148,103 @@ class Agent:
         with open(self._session_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    def chat(self, user_input: str) -> str:
-        """送出訊息，取得回應"""
+    def _prepare_context(self, user_input: str) -> list[Message]:
+        """共用邏輯：加入 user 訊息、log、組裝 context"""
         self.messages.append(Message(role="user", content=user_input))
         self._append_log("user", user_input)
 
+        assembled, stats = self.assembler.assemble(
+            self.messages[0], self.messages[1:], summary=self.summary,
+        )
+        self.last_stats = stats
+
+        logging.info(">>> Context 組裝：included=%d, dropped=%d, tokens=%d",
+                     stats["included"], stats["dropped"], stats["total_tokens"])
         logging.info(">>> 送出給模型的 messages:\n%s",
-        json.dumps([m.to_dict() for m in self.messages], ensure_ascii=False, indent=2))
+                     json.dumps([m.to_dict() for m in assembled], ensure_ascii=False, indent=2))
+        return assembled
 
-        response = self.provider.chat(self.messages)
+    def _finalize(self, reply: str):
+        """共用邏輯：記錄回應、觸發摘要"""
+        logging.info("<<< 模型回應:\n%s", reply)
+        self.messages.append(Message(role="assistant", content=reply))
+        self._append_log("assistant", reply)
+        self._maybe_summarize()
 
-        logging.info("<<< 模型回應:\n%s", response.content)
+    def chat(self, user_input: str) -> str:
+        """送出訊息，執行 ReAct loop（LLM → 工具 → LLM → ... → 最終回答）"""
+        assembled = self._prepare_context(user_input)
+        tools_schema = self.tools.list_schemas() if self.tools else None
 
-        self.messages.append(Message(role="assistant", content=response.content))
-        self._append_log("assistant", response.content)
-        return response.content
+        for i in range(self.MAX_ITERATIONS):
+            response = self.provider.chat(assembled, tools=tools_schema)
+
+            # 沒有工具呼叫 → 就是最終回答
+            if not response.tool_calls:
+                self._finalize(response.content)
+                return response.content
+
+            # 有工具呼叫 → 執行並把結果餵回去
+            assistant_msg = Message(
+                role="assistant",
+                content=response.content or "",
+                tool_calls=response.tool_calls,
+            )
+            assembled.append(assistant_msg)
+
+            for call in response.tool_calls:
+                tool_name = call["function"]["name"]
+                try:
+                    args = json.loads(call["function"]["arguments"])
+                except json.JSONDecodeError:
+                    args = {}
+
+                logging.info(">>> [iter %d] Tool call: %s(%s)", i, tool_name, args)
+
+                try:
+                    result = self.tools.get(tool_name)(**args)
+                except Exception as e:
+                    result = f"錯誤：{e}"
+
+                logging.info("<<< [iter %d] Tool result: %s", i, str(result)[:500])
+
+                assembled.append(Message(
+                    role="tool",
+                    content=str(result),
+                    tool_call_id=call["id"],
+                    name=tool_name,
+                ))
+
+        # 達到最大迭代次數
+        fallback = "（ReAct loop 達到最大迭代次數，終止）"
+        self._finalize(fallback)
+        return fallback
+
+    def chat_stream(self, user_input: str) -> Iterator[str]:
+        """串流送出訊息，逐 token 產出，結束後自動記錄"""
+        assembled = self._prepare_context(user_input)
+        full_response = ""
+        for token in self.provider.stream(assembled):
+            full_response += token
+            yield token
+        self._finalize(full_response)
+
+    def _maybe_summarize(self):
+        """訊息數超過閾值時，把最舊的一半壓縮成摘要，並從記憶中移除（JSONL 保留）"""
+        history_count = len(self.messages) - 1  # 扣掉 system
+        if history_count <= self.SUMMARIZE_THRESHOLD:
+            return
+
+        half = history_count // 2
+        old_messages = self.messages[1:1 + half]
+
+        logging.info(">>> 觸發摘要：壓縮最舊 %d 條訊息", len(old_messages))
+        self.summary = self.summarizer.summarize(old_messages, existing=self.summary)
+        self._save_summary()
+        logging.info("<<< 新摘要:\n%s", self.summary)
+
+        # 從記憶中移除已摘要的舊訊息
+        self.messages = [self.messages[0]] + self.messages[1 + half:]
 
     def list_sessions(self) -> list[dict]:
         """列出當前專案的所有 session"""
@@ -153,6 +258,9 @@ class Agent:
         return sessions
 
     def clear_history(self):
-        """清除記憶中的對話歷史（JSONL 保留）"""
+        """清除記憶中的對話歷史與摘要（JSONL 保留）"""
         system_msg = self.messages[0]
         self.messages = [system_msg]
+        self.summary = ""
+        if os.path.exists(self._summary_path):
+            os.remove(self._summary_path)

@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -20,7 +23,9 @@ console = Console()
 
 # 集中註冊所有 LLM
 registry = ProviderRegistry()
-registry.register("fast", LLM(model="ollama_chat/qwen3:4b"), default=True)
+_model = os.getenv("LLM_MODEL", "ollama_chat/qwen3:4b")
+_api_base = os.getenv("LLM_API_BASE")
+registry.register("fast", LLM(model=_model, base_url=_api_base), default=True)
 
 # 全部工具（含寫入類，給 Executor 用）
 tools = ToolRegistry()
